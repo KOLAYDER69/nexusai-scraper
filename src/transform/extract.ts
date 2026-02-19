@@ -31,7 +31,7 @@ export function extractMainContent(html: string, onlyMainContent: boolean): stri
 
   // Priority 4: highest text-density element
   const candidates = $('div, section').toArray()
-  let bestEl: cheerio.Element | null = null
+  let bestEl: ReturnType<typeof candidates['at']> = undefined
   let bestDensity = 0
 
   for (const el of candidates) {
