@@ -43,7 +43,7 @@ router.post('/scrape', async (req, res) => {
       markdown: '',
       metadata: {},
       status: 403,
-      error: `Platform ${platform} requires residential proxy — BRIGHT_DATA credentials not configured`,
+      error: `Platform ${platform} requires residential proxy — WEBSHARE_API_TOKEN not configured`,
     } satisfies ScrapeResponse)
   }
 
@@ -176,79 +176,164 @@ async function scrapeWithAutoMap(
 
 // ─── Platform-specific Playwright handlers ────────────────────────────────
 
-function detectPlatform(url: string): 'youtube' | 'twitch' | null {
+type Platform = 'youtube' | 'twitch' | 'instagram' | 'tiktok'
+
+function detectPlatform(url: string): Platform | null {
   try {
     const host = new URL(url).hostname.replace(/^www\./, '')
     if (host.includes('youtube.com')) return 'youtube'
     if (host.includes('twitch.tv')) return 'twitch'
+    if (host.includes('instagram.com')) return 'instagram'
+    if (host.includes('tiktok.com')) return 'tiktok'
   } catch { /* ignore */ }
   return null
 }
 
+/** Navigation timeout for platform pages (heavy SPAs) */
+const PLATFORM_NAV_TIMEOUT = 60_000
+
 /**
- * YouTube: Click "more info" / about section to reveal channel links and description.
- * Extracts subscriber count + links section from DOM before sanitization strips them.
+ * YouTube: Opens the "About" modal (channel description + links) and extracts
+ * subscriber count, business email, social links, and description.
+ *
+ * The About modal is the ONLY reliable source for business emails and
+ * external links on YouTube channels. Flow:
+ *   1. Land on channel page → extract subscriber count
+ *   2. Click "More about this channel" trigger (current YT layout uses
+ *      the channel handle/name area or a dedicated "...more" button)
+ *   3. Wait for the about modal (#description-container or the about panel)
+ *   4. Extract all external links + description text
  */
 async function handleYouTube(page: Page): Promise<string> {
   const parts: string[] = []
 
   try {
-    // Extract subscriber count from channel header
+    // ── 1. Subscriber count (visible on channel header before any clicks) ──
     const subCount = await page.evaluate(() => {
-      // ytd-c4-tabbed-header-renderer #subscriber-count, or yt-formatted-string near "subscribers"
+      // Primary: #subscriber-count in channel header
       const el = document.querySelector('#subscriber-count') as HTMLElement | null
-      return el?.innerText?.trim() ?? ''
+      if (el?.innerText?.trim()) return el.innerText.trim()
+      // Fallback: yt-formatted-string containing "subscriber"
+      for (const node of document.querySelectorAll('yt-formatted-string')) {
+        const text = (node as HTMLElement).innerText?.trim() ?? ''
+        if (/subscribers?$/i.test(text)) return text
+      }
+      return ''
     }).catch(() => '')
     if (subCount) parts.push(`Subscribers: ${subCount}`)
 
-    // Try clicking "More about this channel" or the about tab
-    const aboutSelectors = [
-      'tp-yt-paper-tab:has-text("About")',           // About tab (old layout)
-      '#tabsContent a[href*="/about"]',               // About tab link
-      'button:has-text("more about this channel")',   // Modal trigger
-      '#description-container .more-button',          // Expand description
-      'tp-yt-paper-button#expand',                    // Expand button
+    // ── 2. Open the About modal / section ──
+    // YouTube 2024-2026 layout: clicking "...more" or the channel description
+    // area opens a modal overlay with #description-container showing links.
+    const aboutTriggers = [
+      // New layout: "...more" button under channel description snippet
+      '#channel-header-content yt-formatted-string#description-text',
+      'button#description-expand-button',
+      'tp-yt-paper-button#expand',
+      // About tab link (older layout, still works on some channels)
+      '#tabsContent yt-tab-shape[tab-title="About"]',
+      '#tabsContent a[href*="/about"]',
+      'tp-yt-paper-tab:has-text("About")',
+      // "More about this channel" text trigger
+      'button:has-text("more about this channel")',
+      'yt-button-shape:has-text("more")',
+      // Channel name click (sometimes opens about)
+      '#channel-header ytd-channel-name a',
     ]
 
-    for (const sel of aboutSelectors) {
+    let modalOpened = false
+    for (const sel of aboutTriggers) {
       try {
         const el = await page.$(sel)
         if (el && await el.isVisible()) {
+          console.log(`[youtube-handler] Clicking about trigger: ${sel}`)
           await el.click()
+          // Wait for the about container/modal to appear
+          await page.waitForSelector(
+            '#description-container, #about-container, ytd-about-channel-renderer, [page-subtype="about"]',
+            { state: 'visible', timeout: 5000 }
+          ).catch(() => {})
           await page.waitForTimeout(1500)
+          modalOpened = true
           break
         }
-      } catch { /* try next */ }
+      } catch { /* try next selector */ }
     }
 
-    // Extract all links from the about section / channel links panel
+    console.log(`[youtube-handler] Modal opened: ${modalOpened}`)
+
+    // ── 3. Extract all external links from the about/links section ──
     const links = await page.evaluate(() => {
       const result: string[] = []
-      // Channel links section (new layout)
-      document.querySelectorAll('#link-list-container a, #links-section a, [id*="channel-links"] a').forEach(a => {
-        const href = (a as HTMLAnchorElement).href
-        const text = (a as HTMLElement).innerText?.trim()
-        if (href && !href.includes('youtube.com') && text) {
-          result.push(`${text}: ${href}`)
-        }
-      })
-      // About section text
-      const aboutEl = document.querySelector('#about-container, #description-container, [id*="about"]') as HTMLElement | null
-      if (aboutEl?.innerText) {
-        result.push(`About: ${aboutEl.innerText.slice(0, 2000)}`)
+      const seen = new Set<string>()
+
+      // All link containers YouTube uses for channel links
+      const linkSelectors = [
+        '#link-list-container a',
+        '#links-section a',
+        '#primary-links a',
+        '#secondary-links a',
+        'ytd-channel-external-link-view-model a',
+        '[id*="channel-links"] a',
+        '#about-container a',
+        '#description-container a',
+        'ytd-about-channel-renderer a',
+      ]
+
+      for (const sel of linkSelectors) {
+        document.querySelectorAll(sel).forEach(a => {
+          const anchor = a as HTMLAnchorElement
+          let href = anchor.href
+          // YouTube redirects external links through redirect URLs
+          if (href.includes('youtube.com/redirect') || href.includes('google.com/url')) {
+            try {
+              const redirectUrl = new URL(href)
+              href = redirectUrl.searchParams.get('q') || redirectUrl.searchParams.get('url') || href
+            } catch { /* keep original */ }
+          }
+          const text = (a as HTMLElement).innerText?.trim()
+          // Only external links (not youtube.com internal)
+          if (href && !href.includes('youtube.com') && !href.includes('google.com/') && text && !seen.has(href)) {
+            seen.add(href)
+            result.push(`${text}: ${href}`)
+          }
+        })
       }
       return result
     }).catch(() => [] as string[])
 
-    parts.push(...links)
+    if (links.length > 0) {
+      parts.push('Links:')
+      parts.push(...links)
+    }
 
-    // Extract channel description
-    const description = await page.evaluate(() => {
-      const el = document.querySelector('#channel-tagline, #channel-description, meta[name="description"]') as HTMLElement | null
-      if (el instanceof HTMLMetaElement) return el.content?.slice(0, 500) ?? ''
-      return el?.innerText?.slice(0, 500) ?? ''
+    // ── 4. Extract about/description text (business emails often here) ──
+    const aboutText = await page.evaluate(() => {
+      const containers = [
+        '#description-container',
+        '#about-container',
+        'ytd-about-channel-renderer',
+        '#description',
+        '#bio',
+      ]
+      for (const sel of containers) {
+        const el = document.querySelector(sel) as HTMLElement | null
+        if (el?.innerText && el.innerText.trim().length > 20) {
+          return el.innerText.trim().slice(0, 3000)
+        }
+      }
+      // Fallback: meta description
+      const meta = document.querySelector('meta[name="description"]') as HTMLMetaElement | null
+      return meta?.content?.slice(0, 500) ?? ''
     }).catch(() => '')
-    if (description) parts.push(`Description: ${description}`)
+    if (aboutText) parts.push(`About: ${aboutText}`)
+
+    // ── 5. Extract channel tagline / short description ──
+    const tagline = await page.evaluate(() => {
+      const el = document.querySelector('#channel-tagline, #channel-header-content #description-text') as HTMLElement | null
+      return el?.innerText?.trim()?.slice(0, 300) ?? ''
+    }).catch(() => '')
+    if (tagline && !aboutText.includes(tagline)) parts.push(`Tagline: ${tagline}`)
 
   } catch (err) {
     console.log(`[youtube-handler] Error: ${err instanceof Error ? err.message : err}`)
@@ -258,18 +343,21 @@ async function handleYouTube(page: Page): Promise<string> {
 }
 
 /**
- * Twitch: Dismiss cookie wall, wait for follower count metadata to render.
- * Extracts follower count and channel bio from rendered DOM.
+ * Twitch: Full SPA handling with extended timeouts.
+ * Dismisses cookie/consent wall, waits for React hydration,
+ * extracts follower count, channel bio, and social links from panels.
  */
 async function handleTwitch(page: Page): Promise<string> {
   const parts: string[] = []
 
   try {
-    // Twitch cookie consent wall — more aggressive than generic consent
+    // ── 1. Dismiss cookie consent (Twitch-specific + generic) ──
     const twitchConsentSelectors = [
       'button[data-a-target="consent-banner-accept"]',
       '[data-a-target="consent-banner"] button:first-of-type',
       'button:has-text("Accept")',
+      'button:has-text("I Agree")',
+      'button:has-text("Agree")',
     ]
 
     for (const sel of twitchConsentSelectors) {
@@ -277,20 +365,49 @@ async function handleTwitch(page: Page): Promise<string> {
         const el = await page.$(sel)
         if (el && await el.isVisible()) {
           await el.click()
-          await page.waitForTimeout(1000)
+          console.log(`[twitch-handler] Dismissed consent: ${sel}`)
+          await page.waitForTimeout(1500)
           break
         }
       } catch { /* try next */ }
     }
 
-    // Wait for follower count to render (JS-heavy SPA)
-    await page.waitForSelector('[data-a-target="followers-count"], .tw-stat, [class*="ChannelInfoBar"]', {
-      timeout: 8000,
-    }).catch(() => {})
+    // ── 2. Wait for page hydration (Twitch is a heavy React SPA) ──
+    // Wait for any of these indicators that the page has loaded
+    await page.waitForSelector(
+      '[data-a-target="followers-count"], ' +
+      '[data-a-target="channel-viewers-count"], ' +
+      '.channel-info-content, ' +
+      '[class*="ChannelInfoBar"], ' +
+      'h1[data-a-target="stream-title"]',
+      { timeout: 15_000 }
+    ).catch(() => {
+      console.log('[twitch-handler] Timeout waiting for page hydration, extracting what we can')
+    })
 
-    // Extract follower count
+    // Extra settle for React renders
+    await page.waitForTimeout(3000)
+
+    // ── 3. Click "About" panel if available ──
+    const aboutSelectors = [
+      '[data-a-target="about-panel-button"]',
+      'button:has-text("About")',
+      'a[href*="/about"]',
+    ]
+    for (const sel of aboutSelectors) {
+      try {
+        const el = await page.$(sel)
+        if (el && await el.isVisible()) {
+          await el.click()
+          await page.waitForTimeout(2000)
+          console.log(`[twitch-handler] Clicked About: ${sel}`)
+          break
+        }
+      } catch { /* next */ }
+    }
+
+    // ── 4. Extract follower count ──
     const followers = await page.evaluate(() => {
-      // Try multiple known selectors for follower count
       const selectors = [
         '[data-a-target="followers-count"]',
         '.tw-stat__value',
@@ -300,24 +417,57 @@ async function handleTwitch(page: Page): Promise<string> {
         const el = document.querySelector(sel) as HTMLElement | null
         if (el?.innerText) return el.innerText.trim()
       }
-      // Fallback: find text matching "X followers" pattern
+      // Fallback: regex from full page text
       const body = document.body.innerText
       const match = body.match(/([\d,.]+[KkMm]?)\s*(?:followers?)/i)
       return match ? match[0] : ''
     }).catch(() => '')
     if (followers) parts.push(`Followers: ${followers}`)
 
-    // Extract channel bio/about
+    // ── 5. Extract channel bio/about text ──
     const bio = await page.evaluate(() => {
-      const panels = document.querySelectorAll('[class*="about"], [data-a-target="profile-panel"], .channel-info-content')
+      const containers = [
+        '[data-a-target="profile-panel"]',
+        '.about-section',
+        '.channel-info-content',
+        '[class*="AboutPanel"]',
+        '[class*="about"]',
+      ]
       const texts: string[] = []
-      panels.forEach(el => {
-        const text = (el as HTMLElement).innerText?.trim()
-        if (text && text.length > 10) texts.push(text)
-      })
-      return texts.join('\n').slice(0, 1500)
+      for (const sel of containers) {
+        document.querySelectorAll(sel).forEach(el => {
+          const text = (el as HTMLElement).innerText?.trim()
+          if (text && text.length > 10) texts.push(text)
+        })
+      }
+      return texts.join('\n').slice(0, 2000)
     }).catch(() => '')
     if (bio) parts.push(`Bio: ${bio}`)
+
+    // ── 6. Extract social/external links from panels ──
+    const socialLinks = await page.evaluate(() => {
+      const result: string[] = []
+      const seen = new Set<string>()
+      // Twitch social links panel
+      document.querySelectorAll(
+        '[data-a-target="social-media-link"] a, ' +
+        '.social-media-link a, ' +
+        '.channel-panels a, ' +
+        '[class*="panel"] a'
+      ).forEach(a => {
+        const href = (a as HTMLAnchorElement).href
+        const text = (a as HTMLElement).innerText?.trim()
+        if (href && !href.includes('twitch.tv') && !seen.has(href)) {
+          seen.add(href)
+          result.push(text ? `${text}: ${href}` : href)
+        }
+      })
+      return result
+    }).catch(() => [] as string[])
+    if (socialLinks.length > 0) {
+      parts.push('Social links:')
+      parts.push(...socialLinks)
+    }
 
   } catch (err) {
     console.log(`[twitch-handler] Error: ${err instanceof Error ? err.message : err}`)
@@ -341,12 +491,16 @@ async function scrapePage(
   try {
     console.log(`[SCRAPE_START] url=${url} platform=${platform ?? 'generic'}`)
 
+    // Platform pages (YouTube, Twitch) are heavy SPAs — use longer timeouts
+    const navTimeout = platform ? PLATFORM_NAV_TIMEOUT : 20_000
+    const fallbackTimeout = platform ? 30_000 : 15_000
+
     // Try networkidle first (catches SPA content), fall back to domcontentloaded
     let response = await page
-      .goto(url, { waitUntil: 'networkidle', timeout: 20_000 })
+      .goto(url, { waitUntil: 'networkidle', timeout: navTimeout })
       .catch(async () => {
         // networkidle timed out (common on heavy sites), retry with domcontentloaded
-        return page.goto(url, { waitUntil: 'domcontentloaded', timeout: 15_000 })
+        return page.goto(url, { waitUntil: 'domcontentloaded', timeout: fallbackTimeout })
       })
 
     const status = response?.status() ?? 0

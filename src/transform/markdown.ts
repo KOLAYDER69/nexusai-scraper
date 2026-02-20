@@ -47,6 +47,20 @@ function getService(): TurndownService {
     replacement: () => '',
   })
 
+  // Preserve all external links with full href (critical for YouTube About links section)
+  service.addRule('externalLinks', {
+    filter: (node) => {
+      if (node.nodeName !== 'A') return false
+      const href = node.getAttribute('href') ?? ''
+      return href.startsWith('http') && (node.textContent?.trim().length ?? 0) > 0
+    },
+    replacement: (_content, node) => {
+      const href = node.getAttribute('href') ?? ''
+      const text = node.textContent?.trim() ?? ''
+      return `[${text}](${href})`
+    },
+  })
+
   // Images with descriptive alt text → keep as text reference (no URL to save tokens)
   service.addRule('descriptiveImages', {
     filter: 'img',
