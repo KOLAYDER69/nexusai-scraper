@@ -335,6 +335,95 @@ async function handleYouTube(page: Page): Promise<string> {
     }).catch(() => '')
     if (tagline && !aboutText.includes(tagline)) parts.push(`Tagline: ${tagline}`)
 
+    // ── 6. Extract recent video descriptions (business emails often here) ──
+    try {
+      const videoTabSelectors = [
+        'yt-tab-shape[tab-title="Videos"]',
+        'a[href*="/videos"]',
+        'tp-yt-paper-tab:has-text("Videos")',
+      ]
+
+      let videosTabClicked = false
+      for (const sel of videoTabSelectors) {
+        try {
+          const el = await page.$(sel)
+          if (el && await el.isVisible()) {
+            await el.click()
+            await page.waitForTimeout(2000)
+            videosTabClicked = true
+            console.log(`[youtube-handler] Clicked Videos tab: ${sel}`)
+            break
+          }
+        } catch { /* try next */ }
+      }
+
+      if (videosTabClicked) {
+        // Get first 3 video URLs
+        const videoUrls = await page.evaluate(() => {
+          const links: string[] = []
+          const seen = new Set<string>()
+          const selectors = ['a#video-title-link', 'a#video-title']
+          for (const sel of selectors) {
+            document.querySelectorAll(sel).forEach(a => {
+              const href = (a as HTMLAnchorElement).href
+              if (href && href.includes('/watch') && !seen.has(href) && links.length < 3) {
+                seen.add(href)
+                links.push(href)
+              }
+            })
+          }
+          return links
+        }).catch(() => [] as string[])
+
+        if (videoUrls.length > 0) {
+          const videoDescriptions: string[] = []
+          const context = page.context()
+
+          for (const videoUrl of videoUrls.slice(0, 3)) {
+            let videoPage: Page | null = null
+            try {
+              videoPage = await context.newPage()
+              await videoPage.goto(videoUrl, { waitUntil: 'domcontentloaded', timeout: 15_000 })
+              await videoPage.waitForTimeout(2000)
+
+              // Click expand button to show full description
+              const expandBtn = await videoPage.$('#expand')
+              if (expandBtn && await expandBtn.isVisible()) {
+                await expandBtn.click()
+                await videoPage.waitForTimeout(1000)
+              }
+
+              // Extract description text
+              const desc = await videoPage.evaluate(() => {
+                const containers = ['#description-inner', 'ytd-text-inline-expander']
+                for (const sel of containers) {
+                  const el = document.querySelector(sel) as HTMLElement | null
+                  if (el?.innerText && el.innerText.trim().length > 20) {
+                    return el.innerText.trim().slice(0, 2000)
+                  }
+                }
+                return ''
+              }).catch(() => '')
+
+              if (desc) videoDescriptions.push(desc)
+            } catch {
+              // Video page failed, continue
+            } finally {
+              if (videoPage) await videoPage.close()
+            }
+          }
+
+          if (videoDescriptions.length > 0) {
+            parts.push('Recent Video Descriptions:')
+            videoDescriptions.forEach((d, i) => parts.push(`  Video ${i + 1}: ${d}`))
+            console.log(`[youtube-handler] Extracted ${videoDescriptions.length} video description(s)`)
+          }
+        }
+      }
+    } catch (err) {
+      console.log(`[youtube-handler] Video descriptions extraction failed: ${err instanceof Error ? err.message : err}`)
+    }
+
   } catch (err) {
     console.log(`[youtube-handler] Error: ${err instanceof Error ? err.message : err}`)
   }
@@ -380,7 +469,7 @@ async function handleTwitch(page: Page): Promise<string> {
       '.channel-info-content, ' +
       '[class*="ChannelInfoBar"], ' +
       'h1[data-a-target="stream-title"]',
-      { timeout: 15_000 }
+      { timeout: 17_000 }
     ).catch(() => {
       console.log('[twitch-handler] Timeout waiting for page hydration, extracting what we can')
     })
